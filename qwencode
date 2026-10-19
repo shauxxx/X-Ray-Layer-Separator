@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Улучшенная реконструкция DTS с несколькими моделями геометрии и отладкой.
+Shift-and-Add реконструкция с использованием ВСЕХ кадров.
 """
 
-from __future__ import annotations
+IMAGE_EXTS = {".png", ".tif", ".tiff", ".bmp", ".jpg", ".jpeg"}
 
 import configparser
 import math
@@ -12,16 +12,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 
 
-IMAGE_EXTS = {".png", ".tif", ".tiff", ".bmp", ".jpg", ".jpeg"}
-
-
-def read_log(path: Path) -> configparser.ConfigParser:
+def read_log(path: Path):
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.optionxform = str
-    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         cfg.read_file(f)
     return cfg
 
@@ -29,464 +25,144 @@ def read_log(path: Path) -> configparser.ConfigParser:
 def get_float(cfg, section, key, default):
     try:
         val = cfg[section][key].strip()
-        if val == '':
-            return float(default)
-        return float(val)
-    except (KeyError, ValueError):
+        return float(val) if val else float(default)
+    except:
         return float(default)
 
 
-def get_int(cfg, section, key, default):
-    try:
-        return int(float(cfg[section][key].strip()))
-    except (KeyError, ValueError):
-        return int(default)
-
-
-def get_bool(cfg, section, key, default=False):
-    try:
-        val = cfg[section][key].strip().upper()
-        return val in ("YES", "TRUE", "1", "ON")
-    except (KeyError, ValueError):
-        return default
-
-
 def natural_key(path: Path):
-    return [int(s) if s.isdigit() else s.lower()
-            for s in re.split(r"(\d+)", path.name)]
+    return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", path.name)]
 
 
-def load_grayscale(path: Path) -> np.ndarray:
+def load_grayscale(path: Path):
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise RuntimeError(f"Не удалось прочитать: {path}")
     if image.ndim == 3:
-        if image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-        else:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY if image.shape[2] == 3 else cv2.COLOR_BGRA2GRAY)
     return image
 
 
-def normalize_image(image: np.ndarray) -> np.ndarray:
-    """Робастная нормализация с учётом гистограммы."""
+def normalize_image(image):
     a = image.astype(np.float32)
-    
-    # Используем более агрессивные проценты для рентгена
     lo, hi = np.percentile(a, [1.0, 99.0])
     if hi <= lo:
         hi = lo + 1.0
-    
-    normalized = np.clip((a - lo) / (hi - lo), 0.0, 1.0)
-    return normalized
+    return np.clip((a - lo) / (hi - lo), 0.0, 1.0)
 
 
-def compute_geometry(cfg):
-    """Вычисление параметров геометрии."""
-    sod = get_float(cfg, "Acquisition", "Object to Source (mm)", 106.041)
-    sdd = get_float(cfg, "Acquisition", "Camera to Source (mm)", 237.6)
-    pixel_um = get_float(cfg, "Acquisition", "Scaled Image Pixel Size (um)", 137.584)
-    pixel_size_mm = pixel_um / 1000.0
-    
-    magnification = sdd / sod
-    object_to_detector = sdd - sod
-    
-    # Detector shifts
-    det_left = get_float(cfg, "DetectorShifts", "Left", 0)
-    det_top = get_float(cfg, "DetectorShifts", "Top", 0)
-    det_right = get_float(cfg, "DetectorShifts", "Right", 0)
-    det_bottom = get_float(cfg, "DetectorShifts", "Bottom", 0)
-    
-    return {
-        'sod': sod,
-        'sdd': sdd,
-        'pixel_size_mm': pixel_size_mm,
-        'magnification': magnification,
-        'object_to_detector': object_to_detector,
-        'det_shifts': (det_left, det_top, det_right, det_bottom)
-    }
-
-
-def get_frame_angles(cfg, num_frames):
-    """Вычисление углов для каждого кадра."""
-    step = get_float(cfg, "Acquisition", "Rotation Step (deg)", 10.0)
-    direction = cfg.get("Acquisition", "Rotation Direction", fallback="CW").strip().upper()
-    use_360 = get_bool(cfg, "Acquisition", "Use 360 Rotation", True)
-    start_angle = get_float(cfg, "GeometryCorrection", "Angle", 0.0)
-    
-    sign = -1.0 if direction == "CCW" else 1.0
-    
-    if use_360:
-        angles = [start_angle + sign * i * (360.0 / num_frames) 
-                  for i in range(num_frames)]
-    else:
-        angles = [start_angle + sign * i * step 
-                  for i in range(num_frames)]
-    
-    return angles
-
-
-def shift_image(image: np.ndarray, dx: float, dy: float, 
-                fill_value: float = 0.0) -> np.ndarray:
-    """Смещение изображения с субпиксельной точностью."""
+def shift_image(image, dx, dy):
+    """Сдвиг изображения на dx, dy пикселей."""
     h, w = image.shape
-    matrix = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
-    return cv2.warpAffine(
-        image, matrix, (w, h),
-        flags=cv2.INTER_CUBIC,  # Лучшая интерполяция
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=fill_value
-    )
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
 
-def compute_shift_model1(z_mm, angle_deg, geom):
+def compute_shift(z_mm, angle_deg, sod, sdd, pixel_size_mm):
     """
-    Модель 1: tan(θ) с геометрическим увеличением.
-    shift = z * tan(θ) * M / pixel_size
+    Вычисление сдвига для слоя на глубине z при угле angle.
+    
+    Формула из подобия треугольников:
+    shift = z * sin(θ) * (SDD - SOD) / SOD / pixel_size
     """
     angle_rad = math.radians(angle_deg)
-    tan_angle = math.tan(angle_rad)
+    obj_to_det = sdd - sod
+    shift_mm = z_mm * math.sin(angle_rad) * obj_to_det / sod
+    shift_px = shift_mm / pixel_size_mm
+    return shift_px
+
+
+def reconstruct_layer(frames, angles, z_mm, sod, sdd, pixel_size_mm):
+    """
+    Реконструкция одного слоя методом Shift-and-Add.
     
-    # Ограничение для стабильности
-    max_shift = 500  # пикселей
-    tan_angle = np.clip(tan_angle, -max_shift * geom['pixel_size_mm'] / (abs(z_mm) * geom['magnification'] + 1e-9),
-                        max_shift * geom['pixel_size_mm'] / (abs(z_mm) * geom['magnification'] + 1e-9))
-    
-    shift_pixels = z_mm * tan_angle * geom['magnification'] / geom['pixel_size_mm']
-    return shift_pixels, 0.0
-
-
-def compute_shift_model2(z_mm, angle_deg, geom):
+    Для каждого кадра:
+    1. Вычисляем сдвиг для слоя на глубине z
+    2. Сдвигаем кадр обратно (компенсируем)
+    3. Складываем все компенсированные кадры
+    4. Усредняем
     """
-    Модель 2: sin(θ) - более стабильна для больших углов.
-    shift = z * sin(θ) * M / pixel_size
-    """
-    angle_rad = math.radians(angle_deg)
-    sin_angle = math.sin(angle_rad)
-    shift_pixels = z_mm * sin_angle * geom['magnification'] / geom['pixel_size_mm']
-    return shift_pixels, 0.0
-
-
-def compute_shift_model3(z_mm, angle_deg, geom):
-    """
-    Модель 3: упрощённая линейная модель.
-    shift = z * θ(рад) * M / pixel_size
-    """
-    angle_rad = math.radians(angle_deg)
-    shift_pixels = z_mm * angle_rad * geom['magnification'] / geom['pixel_size_mm']
-    return shift_pixels, 0.0
-
-
-def reconstruct_layer(frames, angles_deg, z_depth_mm, geom, 
-                      shift_model='model2', angle_range=None):
-    """
-    Реконструкция слоя методом shift-and-add.
-    
-    angle_range: (min_angle, max_angle) - ограничить диапазон углов
-    """
-    if not frames:
-        raise ValueError("Нет кадров")
-    
     h, w = frames[0].shape
     acc = np.zeros((h, w), dtype=np.float64)
-    weight = np.zeros((h, w), dtype=np.float64)
     
-    # Выбор модели смещения
-    shift_func = {
-        'model1': compute_shift_model1,
-        'model2': compute_shift_model2,
-        'model3': compute_shift_model3,
-    }[shift_model]
+    print(f"Реконструкция слоя на глубине z={z_mm:+.3f}мм...")
     
-    count = 0
-    for frame, angle_deg in zip(frames, angles_deg):
-        # Фильтрация по диапазону углов
-        if angle_range is not None:
-            if angle_deg < angle_range[0] or angle_deg > angle_range[1]:
-                continue
+    for i, (frame, angle) in enumerate(zip(frames, angles)):
+        # Вычисляем сдвиг для этого кадра
+        shift_px = compute_shift(z_mm, angle, sod, sdd, pixel_size_mm)
         
-        dx, dy = shift_func(z_depth_mm, angle_deg, geom)
+        # Компенсируем сдвиг - сдвигаем кадр обратно
+        compensated = shift_image(frame, -shift_px, 0)
         
-        # Смещение кадра
-        shifted = shift_image(frame, dx, dy, fill_value=0.0)
+        # Добавляем к аккумулятору
+        acc += compensated
         
-        # Маска валидных пикселей
-        valid = shift_image(np.ones((h, w), dtype=np.float32), dx, dy, fill_value=0.0)
-        
-        acc += shifted * valid
-        weight += valid
-        count += 1
+        if i % 5 == 0:
+            print(f"  Кадр {i}: угол={angle:.1f}°, сдвиг={shift_px:.2f}px")
     
-    if count == 0:
-        return np.zeros((h, w), dtype=np.float64)
-    
-    weight = np.maximum(weight, 1e-6)
-    result = acc / weight
-    
+    # Усредняем
+    result = acc / len(frames)
     return result
 
 
-def measure_sharpness(image: np.ndarray) -> float:
-    """Измерение резкости через дисперсию Лапласиана."""
-    laplacian = cv2.Laplacian(image, cv2.CV_64F)
-    return float(np.var(laplacian))
-
-
-def find_optimal_depths(frames, angles_deg, geom, 
-                        z_range=(-5.0, 5.0), z_steps=30,
-                        shift_model='model2', angle_range=None):
-    """
-    Поиск оптимальных глубин слоёв по максимальной резкости.
-    """
-    print(f"\nПоиск оптимальных глубин (модель: {shift_model})...")
-    
-    z_values = np.linspace(z_range[0], z_range[1], z_steps)
-    scores = []
-    
-    for z in z_values:
-        recon = reconstruct_layer(frames, angles_deg, z, geom, 
-                                  shift_model, angle_range)
-        score = measure_sharpness(recon)
-        scores.append((z, score))
-        print(f"  z={z:+.3f}mm: sharpness={score:.1f}")
-    
-    # Сортировка по резкости
-    scores.sort(key=lambda x: x[1], reverse=True)
-    
-    # Выбор двух наиболее резких слоёв с достаточным разделением
-    min_separation = (z_range[1] - z_range[0]) * 0.2  # 20% от диапазона
-    
-    z1 = scores[0][0]
-    z2 = None
-    for z, score in scores[1:]:
-        if abs(z - z1) >= min_separation:
-            z2 = z
-            break
-    
-    if z2 is None and len(scores) > 1:
-        z2 = scores[1][0]
-    
-    return z1, z2, scores
-
-
-def enhance_image(image: np.ndarray) -> np.ndarray:
-    """Улучшение изображения для визуализации."""
-    # Нормализация
-    img_norm = np.clip(image * 255.0, 0, 255).astype(np.uint8)
-    
-    # CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(16, 16))
-    enhanced = clahe.apply(img_norm)
-    
-    # Денoising
-    enhanced = cv2.fastNlMeansDenoising(enhanced, None, h=4, 
-                                        templateWindowSize=7, searchWindowSize=21)
-    
-    # Unsharp mask
+def enhance_image(image):
+    img = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
+    enhanced = clahe.apply(img)
+    enhanced = cv2.fastNlMeansDenoising(enhanced, None, h=4, templateWindowSize=7, searchWindowSize=21)
     blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.5)
     sharpened = cv2.addWeighted(enhanced, 1.8, blurred, -0.8, 0)
-    
     return sharpened
 
 
-def visualize_debug(frames, angles_deg, geom, z_test, output_path, 
-                    shift_model='model2', angle_range=None):
-    """Визуализация для отладки."""
-    print(f"\nСоздание отладочной визуализации для z={z_test:+.3f}mm...")
-    
-    # Реконструкция
-    recon = reconstruct_layer(frames, angles_deg, z_test, geom, 
-                              shift_model, angle_range)
-    
-    # Нормализация
-    recon_norm = np.clip(recon * 255.0, 0, 255).astype(np.uint8)
-    enhanced = enhance_image(recon)
-    
-    # Сохранение
-    cv2.imwrite(str(output_path / "debug_recon_raw.png"), recon_norm)
-    cv2.imwrite(str(output_path / "debug_recon_enhanced.png"), enhanced)
-    
-    # Визуализация нескольких кадров со смещениями
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-    
-    # Оригинальные кадры
-    for i in range(4):
-        idx = i * len(frames) // 4
-        axes[0, i].imshow(frames[idx], cmap='gray', vmin=0, vmax=1)
-        axes[0, i].set_title(f"Frame {idx} (angle={angles_deg[idx]:.1f}°)")
-        axes[0, i].axis('off')
-    
-    # Смещённые кадры
-    shift_func = {
-        'model1': compute_shift_model1,
-        'model2': compute_shift_model2,
-        'model3': compute_shift_model3,
-    }[shift_model]
-    
-    for i in range(4):
-        idx = i * len(frames) // 4
-        dx, dy = shift_func(z_test, angles_deg[idx], geom)
-        shifted = shift_image(frames[idx], dx, dy)
-        axes[1, i].imshow(shifted, cmap='gray', vmin=0, vmax=1)
-        axes[1, i].set_title(f"Shifted (dx={dx:.1f}px)")
-        axes[1, i].axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(str(output_path / "debug_frames.png"), dpi=100, bbox_inches='tight')
-    plt.close()
-    
-    # График резкости по глубинам
-    z_values = np.linspace(-5.0, 5.0, 30)
-    scores = []
-    for z in z_values:
-        r = reconstruct_layer(frames, angles_deg, z, geom, shift_model, angle_range)
-        scores.append(measure_sharpness(r))
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(z_values, scores, 'b-', linewidth=2)
-    plt.xlabel('Depth (mm)')
-    plt.ylabel('Sharpness (variance of Laplacian)')
-    plt.title(f'Sharpness vs Depth ({shift_model})')
-    plt.grid(True)
-    plt.axvline(x=z_test, color='r', linestyle='--', label=f'Test z={z_test:.2f}mm')
-    plt.legend()
-    plt.savefig(str(output_path / "debug_sharpness.png"), dpi=100, bbox_inches='tight')
-    plt.close()
-
-
 def main():
-    # ===== НАСТРОЙКИ =====
     input_folder = Path("photo_for_test1")
     log_file = Path("photo_for_test1/s.log")
     output_folder = Path("reconstructed_layers")
     
-    # Параметры поиска глубин
-    z_search_range = (-5.0, 5.0)  # мм
-    z_search_steps = 30
+    # Глубина слоя (половина толщины платы)
+    z_mm = 5  # мм
     
-    # Модель смещения: 'model1' (tan), 'model2' (sin), 'model3' (linear)
-    shift_model = 'model2'
-    
-    # Ограничение диапазона углов (None = все углы)
-    # Для полного оборота можно исключить углы около 90° и 270°
-    angle_range = None  # Например: (-60, 60) для ограниченного диапазона
-    
-    # Тестовая глубина для отладки
-    z_debug = 0.0
-    
-    # Ручные глубины (None = автопоиск)
-    z1_manual = None
-    z2_manual = None
-    
-    # =====================
-    
-    print("=" * 70)
-    print("DTS РЕКОНСТРУКЦИЯ PCB - УЛУЧШЕННАЯ ВЕРСИЯ")
-    print("=" * 70)
-    
-    # Проверка входных данных
-    if not input_folder.is_dir():
-        raise SystemExit(f"Папка не найдена: {input_folder}")
-    if not log_file.is_file():
-        raise SystemExit(f"Лог не найден: {log_file}")
-    
-    # Чтение лога
     cfg = read_log(log_file)
     
-    # Параметры геометрии
-    geom = compute_geometry(cfg)
-    print(f"\nГеометрия системы:")
-    print(f"  SOD: {geom['sod']:.3f} мм")
-    print(f"  SDD: {geom['sdd']:.3f} мм")
-    print(f"  Объект-детектор: {geom['object_to_detector']:.3f} мм")
-    print(f"  Увеличение: {geom['magnification']:.3f}x")
-    print(f"  Размер пикселя: {geom['pixel_size_mm']*1000:.3f} мкм")
-    print(f"  Detector shifts: {geom['det_shifts']}")
+    sod = get_float(cfg, "Acquisition", "Object to Source (mm)", 106.041)
+    sdd = get_float(cfg, "Acquisition", "Camera to Source (mm)", 237.6)
+    pixel_um = get_float(cfg, "Acquisition", "Scaled Image Pixel Size (um)", 137.584)
+    pixel_size_mm = pixel_um / 1000.0
+    start_angle = get_float(cfg, "GeometryCorrection", "Angle", 0.0)
+    direction = cfg.get("Acquisition", "Rotation Direction", fallback="CW").strip().upper()
     
-    # Загрузка изображений
-    files = sorted(
-        (p for p in input_folder.iterdir() if p.suffix.lower() in IMAGE_EXTS),
-        key=natural_key
-    )
-    
-    if len(files) < 2:
-        raise SystemExit("Нужно минимум 2 изображения")
-    
-    print(f"\nНайдено кадров: {len(files)}")
-    
-    # Вычисление углов
-    angles = get_frame_angles(cfg, len(files))
-    print(f"Углы: от {min(angles):.1f}° до {max(angles):.1f}°")
-    print(f"Шаг: {angles[1] - angles[0]:.2f}°" if len(angles) > 1 else "")
-    
-    # Загрузка и нормализация
-    print("\nЗагрузка изображений...")
+    files = sorted((p for p in input_folder.iterdir() if p.suffix.lower() in IMAGE_EXTS), key=natural_key)
     raw_frames = [load_grayscale(p) for p in files]
-    
-    shape = raw_frames[0].shape
-    if any(im.shape != shape for im in raw_frames):
-        raise SystemExit("Размеры изображений различаются!")
-    
-    print(f"Размер: {shape[1]}x{shape[0]}")
-    
     frames = [normalize_image(im) for im in raw_frames]
     
-    # Создание папки вывода
+    n = len(frames)
+    print(f"Всего кадров: {n}")
+    print(f"Геометрия: SOD={sod}мм, SDD={sdd}мм, pixel={pixel_size_mm*1000:.3f}мкм")
+    print(f"Расстояние объект-детектор: {sdd - sod:.3f}мм")
+    
+    # Вычисляем углы для всех кадров
+    sign = 1.0 if direction == "CW" else -1.0
+    angles = [start_angle + sign * i * (360.0 / n) for i in range(n)]
+    
+    print(f"\nУглы: от {angles[0]:.1f}° до {angles[-1]:.1f}°")
+    print(f"Максимальный сдвиг для z={z_mm}мм: {compute_shift(z_mm, 90, sod, sdd, pixel_size_mm):.2f}px")
+    
     output_folder.mkdir(parents=True, exist_ok=True)
     
-    # Отладочная визуализация
-    visualize_debug(frames, angles, geom, z_debug, output_folder, 
-                    shift_model, angle_range)
+    # Реконструкция двух слоёв
+    layer_top = reconstruct_layer(frames, angles, -z_mm, sod, sdd, pixel_size_mm)
+    layer_bottom = reconstruct_layer(frames, angles, +z_mm, sod, sdd, pixel_size_mm)
     
-    # Поиск оптимальных глубин
-    if z1_manual is not None and z2_manual is not None:
-        z1, z2 = z1_manual, z2_manual
-        print(f"\nИспользуются заданные глубины: z1={z1:+.3f}mm, z2={z2:+.3f}mm")
-    else:
-        z1, z2, scores = find_optimal_depths(
-            frames, angles, geom,
-            z_range=z_search_range,
-            z_steps=z_search_steps,
-            shift_model=shift_model,
-            angle_range=angle_range
-        )
-        print(f"\nНайдены глубины: z1={z1:+.3f}mm, z2={z2:+.3f}mm")
-    
-    # Реконструкция слоёв
-    print(f"\nРеконструкция слоёв (модель: {shift_model})...")
-    
-    for idx, (z, label) in enumerate([(z1, "layer_top"), (z2, "layer_bottom")], 1):
-        print(f"\n[{idx}/2] {label} (z={z:+.3f}mm)...")
-        
-        recon = reconstruct_layer(frames, angles, z, geom, 
-                                  shift_model, angle_range)
-        recon = np.clip(recon, 0.0, 1.0)
-        
-        # Сохранение результатов
-        recon_16bit = np.round(recon * 65535.0).astype(np.uint16)
-        cv2.imwrite(str(output_folder / f"{label}_16bit.png"), recon_16bit)
-        
-        recon_8bit = np.round(recon * 255.0).astype(np.uint8)
-        cv2.imwrite(str(output_folder / f"{label}_raw.png"), recon_8bit)
-        
-        enhanced = enhance_image(recon)
+    # Сохранение
+    for layer, label in [(layer_top, "layer_top"), (layer_bottom, "layer_bottom")]:
+        layer = np.clip(layer, 0.0, 1.0)
+        cv2.imwrite(str(output_folder / f"{label}_16bit.png"), 
+                    np.round(layer * 65535.0).astype(np.uint16))
+        enhanced = enhance_image(layer)
         cv2.imwrite(str(output_folder / f"{label}_enhanced.png"), enhanced)
-        
-        sharpness = measure_sharpness(recon)
-        print(f"  Резкость: {sharpness:.1f}")
     
-    print(f"\n{'='*70}")
-    print(f"ГОТОВО! Результаты в: {output_folder.resolve()}")
-    print(f"{'='*70}")
-    print(f"\nОтладочные файлы:")
-    print(f"  - debug_recon_raw.png / debug_recon_enhanced.png")
-    print(f"  - debug_frames.png (оригинальные и смещённые кадры)")
-    print(f"  - debug_sharpness.png (график резкости по глубине)")
-    print(f"\nЕсли результат плохой, попробуйте:")
-    print(f"  1. Другую модель: shift_model = 'model1' или 'model3'")
-    print(f"  2. Ограничить углы: angle_range = (-60, 60)")
-    print(f"  3. Изменить диапазон поиска: z_search_range = (-10, 10)")
-    print(f"  4. Проверить отладочные изображения")
+    print(f"\nГотово. Результаты в: {output_folder.resolve()}")
 
 
 if __name__ == "__main__":

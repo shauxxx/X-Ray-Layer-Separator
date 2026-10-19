@@ -1,0 +1,5 @@
+sense=1
+phi0_deg=356.00
+rotation_step_deg=10.0
+bottom_layer: r_px=17.750 z_mm=3.844
+top_layer: r_px=24.000 z_mm=5.197
